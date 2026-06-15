@@ -119,9 +119,11 @@ SKIP_ENVS = {
     'equation', 'equation*', 'align', 'align*', 'gather', 'gather*',
     'multline', 'multline*', 'eqnarray', 'eqnarray*',
     'lstlisting', 'verbatim', 'Verbatim',
-    'thebibliography', 'algorithm', 'algorithmic', 'algorithmicx',
+    'thebibliography', 'algorithmic', 'algorithmicx',
     'tikzpicture', 'pgfpicture',
-    'figure', 'figure*', 'table', 'table*',
+    'tabular', 'tabularx', 'longtable', 'supertabular', 'tabulary',
+    'wraptable', 'sidewaystable',
+    'wrapfigure', 'subfigure', 'sidewaysfigure',
     'minipage',
 }
 

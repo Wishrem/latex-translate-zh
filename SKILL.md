@@ -9,7 +9,7 @@ description: >-
 metadata:
   category: academic-writing
   tags: [latex, translation, chinese, arxiv, xelatex, pdf, paper]
-  version: "0.1.0"
+  version: "0.1.1"
   last_updated: "2026-06-15"
 allowed-tools: Read, Glob, Grep, Bash, Write, Edit
 ---
