@@ -56,6 +56,9 @@ def _find_matching_brace(s: str, pos: int) -> int:
     depth = 1
     i = pos + 1
     while i < len(s) and depth > 0:
+        if s[i] == '\\':
+            i += 2
+            continue
         if s[i] == open_char:
             depth += 1
         elif s[i] == close_char:
@@ -117,7 +120,9 @@ TRANSLATABLE_ENVS = {
 # Environments to skip entirely (no translation)
 SKIP_ENVS = {
     'equation', 'equation*', 'align', 'align*', 'gather', 'gather*',
-    'multline', 'multline*', 'eqnarray', 'eqnarray*',
+    'multline', 'multline*', 'eqnarray', 'eqnarray*', 'aligned',
+    'alignedat', 'split', 'cases', 'array', 'matrix', 'pmatrix',
+    'bmatrix', 'Bmatrix', 'vmatrix', 'Vmatrix',
     'lstlisting', 'verbatim', 'Verbatim',
     'thebibliography', 'algorithmic', 'algorithmicx',
     'tikzpicture', 'pgfpicture',
@@ -125,6 +130,26 @@ SKIP_ENVS = {
     'wraptable', 'sidewaystable',
     'wrapfigure', 'subfigure', 'sidewaysfigure',
     'minipage',
+}
+
+# Optional arguments for these environments are placement/layout metadata, not text.
+NON_TEXT_ENV_OPTIONS = {
+    'figure', 'figure*', 'table', 'table*', 'wrapfigure', 'wraptable',
+    'minipage', 'tabular', 'tabularx', 'longtable', 'algorithm', 'algorithm*',
+}
+
+# Optional theorem-like titles are text and may be translated.
+TRANSLATABLE_ENV_OPTIONS = {
+    'definition', 'theorem', 'lemma', 'corollary', 'proposition',
+    'remark', 'example', 'assumption', 'claim',
+}
+
+HARD_BREAK_COMMANDS = {
+    r'\begin', r'\end',
+    r'\section', r'\subsection', r'\subsubsection', r'\paragraph',
+    r'\caption',
+    r'\item',
+    r'\bibliography', r'\bibliographystyle',
 }
 
 # Commands whose arguments are never translated
@@ -171,6 +196,111 @@ RE_ENV_BEGIN = re.compile(
 RE_ENV_END = re.compile(
     r'\\end\{([^}]+)\}'
 )
+
+
+def _is_escaped(s: str, pos: int) -> bool:
+    """Return True if s[pos] is escaped by an odd number of backslashes."""
+    count = 0
+    i = pos - 1
+    while i >= 0 and s[i] == '\\':
+        count += 1
+        i -= 1
+    return count % 2 == 1
+
+
+def _skip_spaces_and_options(content: str, pos: int) -> int:
+    """Skip whitespace and bracketed optional arguments."""
+    i = pos
+    while i < len(content):
+        while i < len(content) and content[i] in ' \n\t':
+            i += 1
+        if i < len(content) and content[i] == '[':
+            close = _find_matching_brace(content, i)
+            i = close + 1
+            continue
+        break
+    return i
+
+
+def _strip_latex_for_signal(text: str) -> str:
+    """Approximate text signal after removing commands, math, and punctuation."""
+    text = re.sub(r"(?<!\\)%.*", " ", text)
+    text = re.sub(r"\$\$.*?\$\$|\$.*?\$", " ", text, flags=re.S)
+    text = re.sub(r"\\[A-Za-z@]+\*?(?:\s*\[[^\]]*\])?(?:\s*\{[^{}]*\})*", " ", text)
+    text = re.sub(r"\\.", " ", text)
+    text = re.sub(r"[\[\]{}()0-9.,;:!?~^_&%#$=+\-*/<>|`'\"\\\s]+", " ", text)
+    return text.strip()
+
+
+def _has_translatable_signal(text: str) -> bool:
+    """Return True if text looks like natural language rather than layout syntax."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if re.fullmatch(r"\[?[!htbpH,\s]+\]?", stripped):
+        return False
+    signal = _strip_latex_for_signal(stripped)
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]{3,}", signal))
+
+
+def _is_blank_line_break(content: str, pos: int) -> bool:
+    if pos >= len(content) or content[pos] != '\n':
+        return False
+    i = pos + 1
+    while i < len(content) and content[i] in ' \t':
+        i += 1
+    return i < len(content) and content[i] == '\n'
+
+
+def _skip_inline_group_args(content: str, pos: int) -> int:
+    """Skip optional/required arguments of an inline command while keeping them in a block."""
+    i = pos
+    while i < len(content) and content[i] in ' \t':
+        i += 1
+    while i < len(content) and content[i] in '[{':
+        close = _find_matching_brace(content, i)
+        i = close + 1
+        while i < len(content) and content[i] in ' \t':
+            i += 1
+    return i
+
+
+def _collect_plain_block(content: str, pos: int) -> int:
+    """Collect a paragraph-like block, preserving inline commands and math."""
+    j = pos
+    while j < len(content):
+        if _is_blank_line_break(content, j):
+            break
+        if content[j] == '%' and not _is_escaped(content, j):
+            break
+        if content[j:j+2] in (r'\[', r'\('):
+            end_marker = r'\]' if content[j:j+2] == r'\[' else r'\)'
+            end = content.find(end_marker, j + 2)
+            j = (end + 2) if end != -1 else len(content)
+            continue
+        if content[j:j+2] == '$$':
+            end = content.find('$$', j + 2)
+            j = (end + 2) if end != -1 else len(content)
+            continue
+        if content[j] == '$' and not _is_escaped(content, j):
+            end = j + 1
+            while True:
+                end = content.find('$', end)
+                if end == -1 or not _is_escaped(content, end):
+                    break
+                end += 1
+            j = (end + 1) if end != -1 else len(content)
+            continue
+        if content[j] == '\\':
+            m = RE_CMD.match(content, j)
+            if m:
+                cmd = '\\' + m.group(1)
+                if cmd in HARD_BREAK_COMMANDS:
+                    break
+                j = _skip_inline_group_args(content, m.end())
+                continue
+        j += 1
+    return j
 
 
 def _is_math_mode(text: str, pos: int) -> bool:
@@ -272,8 +402,27 @@ def extract_file(filepath: Path, base_dir: Path) -> list[Block]:
         m_begin = RE_ENV_BEGIN.match(content, i)
         if m_begin:
             env_name = m_begin.group(1)
+            env_begin_pos = i
             env_stack.append(env_name)
             i = m_begin.end()
+            while i < len(content) and content[i] in ' \n\t':
+                i += 1
+            if i < len(content) and content[i] == '[':
+                close = _find_matching_brace(content, i)
+                opt_text = content[i + 1 : close]
+                if env_name in TRANSLATABLE_ENV_OPTIONS and _has_translatable_signal(opt_text):
+                    blocks.append(Block(
+                        block_id=_next_id(),
+                        file=rel_path,
+                        line_start=pos_to_line(i),
+                        line_end=pos_to_line(close),
+                        source_text=opt_text,
+                        context=f"{env_name}_option",
+                    ))
+                # Skip placement/layout options such as [ht] so they are not
+                # later seen as plain text.
+                i = close + 1
+                i = _skip_spaces_and_options(content, i)
             continue
 
         # LaTeX command
@@ -331,8 +480,7 @@ def extract_file(filepath: Path, base_dir: Path) -> list[Block]:
                     i = new_i
 
                     # Only extract if there's actual text (not just commands/math)
-                    stripped = re.sub(r'\\.*?(\{[^}]*\})?', '', inner_text).strip()
-                    if stripped:
+                    if _has_translatable_signal(inner_text):
                         line_start = pos_to_line(i - len(inner_text) - 2)
                         line_end = pos_to_line(i)
                         ctx = cmd[1:]  # remove backslash
@@ -357,39 +505,20 @@ def extract_file(filepath: Path, base_dir: Path) -> list[Block]:
                     break
             continue
 
-        # Plain text: collect until next command, math, or environment marker
+        # Plain text: collect paragraph-like blocks while preserving inline
+        # commands/math. This avoids translating tiny fragments around \cite,
+        # \cref, \sys, and inline formulas without context.
         if not _is_in_skip_env(env_stack) and not _is_math_mode(content, i):
-            j = i
-            while j < len(content):
-                if content[j] == '\\':
-                    # Check if it's a real command, not just \%, \&, etc.
-                    if j + 1 < len(content) and content[j+1] in '%&$#_{}':
-                        j += 2  # skip escaped special chars
-                        continue
-                    break
-                if content[j] == '$':
-                    # Skip escaped $
-                    if j > 0 and content[j-1] == '\\':
-                        j += 1
-                        continue
-                    break
-                if content[j] == '%':
-                    # Skip escaped %
-                    if j > 0 and content[j-1] == '\\':
-                        j += 1
-                        continue
-                    break
-                if content[j] == '}' and env_stack:
-                    # Closing brace might be end of env body
-                    break
-                j += 1
-
+            j = _collect_plain_block(content, i)
+            if j <= i:
+                i += 1
+                continue
             text = content[i:j].strip()
             # Filter out text that's just braces/spaces
             text = re.sub(r'^[\s\}]+', '', text)
             text = re.sub(r'[\s\{]+$', '', text)
 
-            if text and len(text) > 1:
+            if text and _has_translatable_signal(text):
                 line_start = pos_to_line(i)
                 line_end = pos_to_line(j)
                 blocks.append(Block(
@@ -435,7 +564,17 @@ def main():
     )
     parser.add_argument(
         "project_dir",
+        nargs="?",
         help="LaTeX 项目目录",
+    )
+    parser.add_argument(
+        "-d", "--dir",
+        dest="project_dir_opt",
+        help="LaTeX 项目目录（兼容 AGENTS.md 常用命令）",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="输出 JSON 文件路径；默认输出到 stdout",
     )
     parser.add_argument(
         "--files",
@@ -449,7 +588,11 @@ def main():
     )
     args = parser.parse_args()
 
-    root = Path(args.project_dir).resolve()
+    project_dir = args.project_dir or args.project_dir_opt
+    if not project_dir:
+        parser.error("需要提供 project_dir 或 -d/--dir")
+
+    root = Path(project_dir).resolve()
     if not root.is_dir():
         print(f"[ERROR] 目录不存在: {args.project_dir}", file=sys.stderr)
         sys.exit(1)
@@ -457,8 +600,9 @@ def main():
     blocks = extract_project(root, args.files)
 
     if args.jsonl:
+        output_lines = []
         for b in blocks:
-            print(json.dumps({
+            output_lines.append(json.dumps({
                 "block_id": b.block_id,
                 "file": b.file,
                 "line_start": b.line_start,
@@ -466,6 +610,7 @@ def main():
                 "source_text": b.source_text,
                 "context": b.context,
             }, ensure_ascii=False))
+        output_text = "\n".join(output_lines)
     else:
         output = {
             "project_dir": str(root),
@@ -482,7 +627,12 @@ def main():
                 for b in blocks
             ],
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        output_text = json.dumps(output, ensure_ascii=False, indent=2)
+
+    if args.output:
+        Path(args.output).write_text(output_text + "\n", encoding="utf-8")
+    else:
+        print(output_text)
 
     print(f"\n提取完成: {len(blocks)} 个翻译块", file=sys.stderr)
 

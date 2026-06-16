@@ -9,7 +9,7 @@ description: >-
 metadata:
   category: academic-writing
   tags: [latex, translation, chinese, arxiv, xelatex, pdf, paper]
-  version: "0.2.0"
+  version: "0.2.1"
   last_updated: "2026-06-16"
 allowed-tools: Read, Glob, Grep, Bash, Write, Edit
 ---
@@ -26,7 +26,7 @@ allowed-tools: Read, Glob, Grep, Bash, Write, Edit
 1. **获取源文件** — 下载/拷贝 LaTeX 源码到 `/tmp/latex-translate-<id>/`
 2. **结构分析** — 判定单文件/多文件，决定并行或串行翻译策略
 2.5. **基线编译与兼容扫描** — 编译原始英文版，扫描中文兼容风险（fragile macro、负间距等）
-3. **块级翻译** — 提取翻译块 → 翻译 → 回填，多文件时并行加速
+3. **块级翻译** — 提取段落级翻译块 → 翻译 → 回填，多文件时并行加速
 4. **中文排版调优** — 字体匹配、行距计算、字号调节、粗斜体检查
    4.1 字体选型 — 用 match_cjk_font.py 根据拉丁字体风格匹配中文字体
    4.2 行距计算 — 用 compute_baselineskip.py 计算最佳 baselineskip
@@ -34,7 +34,7 @@ allowed-tools: Read, Glob, Grep, Bash, Write, Edit
    4.4 粗斜体检查 — 用 check_cjk_variants.py 检查 Bold/Italic，生成 fallback
    4.5 注入配置 — 将 4.1-4.4 的产出写入 main.tex
 5. **编译与兼容修复** — 编译并自动修复中文兼容问题
-5.5. **PDF验收** — 多遍编译后检查交叉引用、排版和日志
+5.5. **PDF验收** — 多遍编译后检查交叉引用、排版和日志；日志有 `!` 级错误时不得交付
 6. **输出** — 将验收通过的 PDF 复制到当前目录
 
 ---
@@ -159,6 +159,8 @@ cp -r /tmp/latex-translate-<id>/source /tmp/latex-translate-<id>/work_zh/
 - `figure`/`table` 环境结构不变
 
 只替换正文文本节点，不改变项目文件依赖图。原始项目保存在 `/tmp/latex-translate-<id>/source/` 作为只读基线，用于 diff、回滚和结构校验。
+
+**禁止临场手写替代脚本**：提取、合并、回填、编译和验收必须优先使用本 skill 的脚本接口。不要为了扁平化 JSON、批量替换 `\n`、修复反斜杠、复制 PDF 等步骤临场写 Python/sed/perl 脚本；这类脚本容易破坏 LaTeX 结构。若现有脚本接口不足，先修 skill 脚本，再用脚本执行。
 
 ---
 
@@ -412,22 +414,44 @@ grep -RInE '\\begin\{(mdframed|framed|tcolorbox|tabbing|wrapfigure|minipage|figu
 #### 提取文本块
 
 ```bash
-uv run python $SKILL_DIR/scripts/extract_blocks.py /tmp/latex-translate-<id>/work_zh/ > /tmp/latex-translate-<id>/blocks.json
+uv run python $SKILL_DIR/scripts/extract_blocks.py -d /tmp/latex-translate-<id>/work_zh/ -o /tmp/latex-translate-<id>/blocks.json
 ```
 
 输出 `blocks.json`，每个翻译块包含 `block_id`、`file`、`source_text`、`context`。
+
+提取脚本按段落保留内联 LaTeX 命令、数学公式和引用命令，避免把一句话切成 `As shown in`、`, our ...` 这类碎片。它会跳过表格主体、公式环境、算法主体、图片/表格位置参数（如 `[ht]`），只抽取标题、caption、脚注、正文段落等可翻译内容。
 
 #### 翻译文本块
 
 agent 只翻译 `source_text`，返回 `block_id → translation` 映射。**不修改 JSON 中的任何其他字段，不重写 .tex 文件。**
 
+翻译输出格式可以是以下任一形式，回填脚本均可读取：
+
+```json
+{"blocks": [{"block_id": "blk_0001", "translation": "译文"}]}
+```
+
+```json
+{"blk_0001": "译文"}
+```
+
+```json
+{"intro.tex": {"blk_0001": "译文"}}
+```
+
+如果 `context` 是 `section`、`caption`、`textbf`、`emph` 等命令参数，`source_text` 只包含命令内部文字。译文也只写内部文字，不要额外包一层 `\section{}`、`\caption{}`、`\emph{}`。
+
+宏后紧跟中文时必须留边界：写 `\sys{}在`、`\sys 在`、`\cm{}的`，不要写 `\sys在`、`\cm的`，否则 TeX 会把它解析成新的未定义命令。
+
 #### 回填译文
 
 ```bash
-uv run python $SKILL_DIR/scripts/backfill_blocks.py /tmp/latex-translate-<id>/work_zh/ /tmp/latex-translate-<id>/translations.json --blocks /tmp/latex-translate-<id>/blocks.json
+uv run python $SKILL_DIR/scripts/backfill_blocks.py -d /tmp/latex-translate-<id>/work_zh/ -t /tmp/latex-translate-<id>/translations.json --blocks /tmp/latex-translate-<id>/blocks.json
 ```
 
 回填脚本根据 `block_id` 和 `source_text` 精确定位并替换为译文。多个文件时自动并行写入（ThreadPoolExecutor），大幅加速回填速度。串行模式可用 `--no-parallel` 禁用。
+
+回填脚本会拒绝会破坏结构的译文，包括 LaTeX 命令数量变化、数学 `$` 数量变化、表格换行 `\\` 数量变化、疑似布局参数等。遇到 `[SKIP]` 时不要用手写替换绕过；回到对应翻译块修正译文。
 
 ### 3.3 并行翻译（已分文件项目）
 
@@ -447,10 +471,12 @@ uv run python $SKILL_DIR/scripts/backfill_blocks.py /tmp/latex-translate-<id>/wo
   
   术语表: [从主agent传入]
   
-  对每个块，只翻译 source_text 字段为中文，其他字段原样保留。
+  对每个块，只翻译 source_text 字段为中文，其他字段原样保留。输出 JSON，不要重写 .tex。
   
   翻译规则：
   - 保留所有 \cite, \ref, \label 等命令不变（source_text 中可能含有）
+  - 保留所有 LaTeX 宏命令本身不变；宏后接中文要写成 \sys{}在 或 \sys 在
+  - 如果 context 是 section/caption/textbf/emph，只输出内部译文，不要额外包 \section{} 或 \caption{}
   - 缩写保留原文，首次出现加全称
   - 技术名词保留英文
   - 人名不翻译
@@ -461,7 +487,7 @@ uv run python $SKILL_DIR/scripts/backfill_blocks.py /tmp/latex-translate-<id>/wo
 
 5. **合并翻译结果** — 主agent汇总所有子agent的翻译输出
 6. **回填** — 运行 `backfill_blocks.py` 将译文写入 `work_zh/`
-7. **注入中文支持** — 在 `work_zh/` 的主文件中添加 ctex 支持
+7. **注入中文支持** — 在 `work_zh/` 的主文件中添加 xeCJK 支持
 8. **编译** — 编译 `work_zh/` 中的中文版
 
 ### 3.4 顺序翻译（未分文件项目）
@@ -672,24 +698,21 @@ uv run python $SKILL_DIR/scripts/check_cjk_variants.py "Noto Serif CJK SC" --cod
 
 优先采用最小侵入策略：**保留原始 `\documentclass`，只在导言区添加中文支持**。
 
-`ctexart`/`ctexrep`/`ctexbook` 不仅提供中文支持，还会改变标题、字号、行距、中文标点、章节格式等排版参数。对论文模板，尤其是 arXiv 论文、会议模板、双栏模板、含 `mdframed` 的模板，替换 documentclass 极易引发兼容性问题。
+`ctex`/`ctexart`/`ctexrep`/`ctexbook` 不仅提供中文支持，还会改变标题、字号、行距、中文标点、章节格式等排版参数。对论文模板，尤其是 arXiv 论文、会议模板、双栏模板、ACM/IEEE 模板、含 `mdframed` 的模板，优先使用 `ctex` 极易引发兼容性问题。
 
-#### 默认方案：保留原 documentclass
+#### 默认方案：保留原 documentclass + xeCJK
 
-在 `\documentclass{...}` 之后添加：
-
-```latex
-\usepackage[UTF8]{ctex}
-```
-
-如果自动字体检测不可靠，指定已知字体：
+在导言区、`\begin{document}` 之前添加最小 xeCJK 配置：
 
 ```latex
-\usepackage[UTF8,fontset=none]{ctex}
-\setCJKmainfont{Noto Serif CJK SC}
-\setCJKsansfont{Noto Sans CJK SC}
-\setCJKmonofont{Noto Sans Mono CJK SC}
+\usepackage{xeCJK}
+\xeCJKsetup{CJKmath=true, AutoFakeBold=true, AutoFakeSlant=0.167}
+\setCJKmainfont{Noto Serif CJK SC}[Scale=1.05]
+\setCJKsansfont{Noto Sans CJK SC}[Scale=1.05]
+\setCJKmonofont{Noto Sans Mono CJK SC}[Scale=1.05]
 ```
+
+字体名和 Scale 应优先来自 `match_cjk_font.py`、`compute_baselineskip.py`、`check_cjk_variants.py` 的输出。不要同时加载 `ctex` 和 `xeCJK`。
 
 #### 仅在以下条件全部满足时，才替换为 ctexart/ctexrep/ctexbook
 
@@ -697,16 +720,18 @@ uv run python $SKILL_DIR/scripts/check_cjk_variants.py "Noto Serif CJK SC" --cod
 2. 没有会议/期刊模板宏包控制版式
 3. 没有大量自定义标题格式、双栏布局、mdframed/tcolorbox、复杂浮动体
 4. 基线编译和中文试编译均确认替换 documentclass 不造成版式异常
+5. 用户明确接受标题/字号/行距可能变化
 
 #### 禁止事项
 
 - 不得在未知模板中直接把会议/期刊 class 或定制 article 模板替换成 `ctexart`
+- 不得对 ACM/IEEE/USENIX/NeurIPS 等会议模板直接使用 `ctex` 或 `ctexart`
 - 不得对含 `mdframed` + `fontspec` 的模板直接使用 ctexart
 
 ### 5.2 编译命令
 
 ```bash
-uv run python $SKILL_DIR/scripts/compile.py /tmp/latex-translate-<id>/work_zh/main.tex
+uv run python $SKILL_DIR/scripts/compile.py -d /tmp/latex-translate-<id>/work_zh --recipe xelatex-bibtex
 ```
 
 编译脚本自动：
@@ -714,6 +739,9 @@ uv run python $SKILL_DIR/scripts/compile.py /tmp/latex-translate-<id>/work_zh/ma
 - 使用 latexmk 自动多遍编译（处理bibtex/biber交叉引用）
 - 使用 `-no-shell-escape` 安全模式
 - 报告编译错误时，给出具体行号和错误类型
+- 编译后扫描 `.log`，如果存在 `!` 级 LaTeX 错误、未稳定引用、图片加载错误、表格对齐错误等，即使 PDF 文件存在也返回失败
+
+不要用 `| tail`、`grep -v`、`latexmk -f` 或手动 `xelatex && bibtex && xelatex` 来绕过脚本验收。`latexmk -f` 可以生成带错误的 PDF，这种 PDF 不能交付。
 
 ### 5.3 Box/Frame 环境中文兼容修复
 
@@ -888,18 +916,17 @@ grep -RInE '\\newcommand\{\\[A-Za-z@]+\}.*\\xspace|\\caption\{.*\\[A-Za-z@]+' *.
 
 第一遍 XeLaTeX 中出现 `??`、undefined references、undefined citations **不立即视为翻译错误**。这是 LaTeX 正常行为。
 
-必须先执行完整清理和多遍编译：
+必须先通过编译脚本执行完整多遍编译：
 
 ```bash
-cd /tmp/latex-translate-<id>/work_zh
-latexmk -C main.tex
-latexmk -xelatex -bibtex -interaction=nonstopmode main.tex
+uv run python $SKILL_DIR/scripts/compile.py -d /tmp/latex-translate-<id>/work_zh --clean-all
+uv run python $SKILL_DIR/scripts/compile.py -d /tmp/latex-translate-<id>/work_zh --recipe xelatex-bibtex
 ```
 
 或根据项目使用 biber：
 
 ```bash
-latexmk -xelatex -use-biber -interaction=nonstopmode main_zh.tex
+uv run python $SKILL_DIR/scripts/compile.py -d /tmp/latex-translate-<id>/work_zh --recipe xelatex-biber
 ```
 
 只有在最终编译后仍出现以下内容，才视为失败：
@@ -910,6 +937,17 @@ grep -RInE '§\?\?|图 *\?\?|表 *\?\?|\[\?, *\?, *\?\]|Figure *\?\?|Table *\?\?
 ```
 
 如果最终 PDF 中引用正常，不得把第一遍 `??` 归因于翻译破坏结构。
+
+任何最终 `.log` 中残留以下内容都视为失败，不能复制 PDF：
+
+```text
+! Undefined control sequence
+! Misplaced alignment tab character &
+! Missing $ inserted
+! LaTeX Error
+! Package graphics Error
+Unable to load picture or PDF file
+```
 
 ### 5.5.2 结构一致性不是最终验收
 

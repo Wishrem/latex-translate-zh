@@ -43,6 +43,67 @@ def _find_matching_brace(s: str, pos: int) -> int:
     return len(s)
 
 
+def _looks_like_block_id(value: str) -> bool:
+    return bool(re.fullmatch(r"(blk_\d+|[A-Za-z0-9_.:-]+)", value))
+
+
+def _normalize_translation(value: object, block_id: str = "") -> str:
+    """Normalize model-produced translation strings.
+
+    Some agents emit literal "\\n" inside JSON values instead of JSON newlines.
+    Convert only standalone escaped newlines, not LaTeX commands such as
+    \newcommand.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    text = re.sub(r"(?<!\\)\\n(?![A-Za-z@])", "\n", text)
+    text = re.sub(r"(?<!\\)\\t(?![A-Za-z@])", "\t", text)
+    return text
+
+
+def _add_translation(translations: dict[str, str], block_id: object, value: object) -> None:
+    if not isinstance(block_id, str) or not _looks_like_block_id(block_id):
+        return
+    text = _normalize_translation(value, block_id)
+    if text:
+        translations[block_id] = text
+
+
+def _collect_translations(data: object, translations: dict[str, str]) -> None:
+    """Accept common translation JSON shapes.
+
+    Supported:
+      {"blocks": [{"block_id": "blk_0001", "translation": "..."}]}
+      [{"block_id": "blk_0001", "translation": "..."}]
+      {"blk_0001": "..."}
+      {"intro.tex": {"blk_0001": "..."}}
+      {"intro.tex": [{"block_id": "blk_0001", "translation": "..."}]}
+    """
+    if isinstance(data, list):
+        for item in data:
+            _collect_translations(item, translations)
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    if "block_id" in data:
+        value = data.get("translation", data.get("translated_text", data.get("target_text")))
+        _add_translation(translations, data.get("block_id"), value)
+        return
+
+    if "blocks" in data:
+        _collect_translations(data["blocks"], translations)
+        return
+
+    for key, value in data.items():
+        if isinstance(value, str):
+            _add_translation(translations, key, value)
+        elif isinstance(value, (dict, list)):
+            _collect_translations(value, translations)
+
+
 def load_translations(trans_file: Path) -> dict[str, str]:
     """Load translations from JSON or JSONL file."""
     text = trans_file.read_text(encoding="utf-8", errors="ignore").strip()
@@ -52,15 +113,7 @@ def load_translations(trans_file: Path) -> dict[str, str]:
     # Try JSON array/object
     try:
         data = json.loads(text)
-        if isinstance(data, list):
-            for item in data:
-                translations[item["block_id"]] = item["translation"]
-        elif isinstance(data, dict):
-            if "blocks" in data:
-                for item in data["blocks"]:
-                    translations[item["block_id"]] = item["translation"]
-            elif "block_id" in data:
-                translations[data["block_id"]] = data["translation"]
+        _collect_translations(data, translations)
         return translations
     except json.JSONDecodeError:
         pass
@@ -72,11 +125,73 @@ def load_translations(trans_file: Path) -> dict[str, str]:
             continue
         try:
             item = json.loads(line)
-            translations[item["block_id"]] = item["translation"]
+            _collect_translations(item, translations)
         except (json.JSONDecodeError, KeyError):
             continue
 
     return translations
+
+
+def _command_counts(text: str) -> dict[str, int]:
+    commands = [
+        r"\\begin", r"\\end", r"\\label", r"\\ref", r"\\eqref",
+        r"\\cite", r"\\citep", r"\\citet", r"\\cref", r"\\Cref",
+        r"\\includegraphics",
+    ]
+    return {cmd: len(re.findall(re.escape(cmd) + r"\b", text)) for cmd in commands}
+
+
+def _all_command_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for name in re.findall(r"\\[A-Za-z@]+\*?", text):
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _has_suspicious_escape(text: str) -> bool:
+    """Detect common escaped-control leftovers from generated JSON."""
+    return bool(re.search(r"(?<!\\)\\[nt](?![A-Za-z@])", text))
+
+
+def validate_translation(source_text: str, translation: str) -> tuple[bool, str]:
+    """Reject translations that are likely to break LaTeX structure."""
+    if not translation.strip():
+        return False, "译文为空"
+
+    if _has_suspicious_escape(translation):
+        return False, "译文包含疑似未解码的 \\n 或 \\t"
+
+    src_counts = _command_counts(source_text)
+    dst_counts = _command_counts(translation)
+    changed = [
+        f"{cmd}: {src_counts[cmd]}->{dst_counts[cmd]}"
+        for cmd in src_counts
+        if src_counts[cmd] != dst_counts[cmd]
+    ]
+    if changed:
+        return False, "LaTeX 命令数量变化: " + ", ".join(changed)
+
+    src_all = _all_command_counts(source_text)
+    dst_all = _all_command_counts(translation)
+    if src_all != dst_all:
+        names = sorted(set(src_all) | set(dst_all))
+        changed_all = [
+            f"{name}: {src_all.get(name, 0)}->{dst_all.get(name, 0)}"
+            for name in names
+            if src_all.get(name, 0) != dst_all.get(name, 0)
+        ]
+        return False, "LaTeX 宏集合变化: " + ", ".join(changed_all[:12])
+
+    if source_text.count("$") != translation.count("$"):
+        return False, "数学模式 $ 数量变化"
+
+    if source_text.count("\\\\") != translation.count("\\\\"):
+        return False, r"换行命令 \\ 数量变化"
+
+    if re.fullmatch(r"\[?[!htbpH,\s]+\]?", source_text.strip()):
+        return False, "疑似布局参数，不应回填"
+
+    return True, ""
 
 
 def load_source_blocks(blocks_file: Optional[Path], translations: dict[str, str]) -> dict[str, dict]:
@@ -127,6 +242,11 @@ def backfill_file(
         source_text = info.get("source_text", "")
 
         if not source_text:
+            continue
+
+        ok, reason = validate_translation(source_text, translation)
+        if not ok:
+            print(f"  [SKIP] {block_id}: {reason}", file=sys.stderr)
             continue
 
         # Only replace if source_text appears exactly once
@@ -217,12 +337,16 @@ def main():
     )
     parser.add_argument(
         "project_dir",
+        nargs="?",
         help="LaTeX 项目目录（复制出的工作目录）",
     )
     parser.add_argument(
         "translations",
+        nargs="?",
         help="翻译 JSON 文件（block_id → translation）",
     )
+    parser.add_argument("-d", "--dir", dest="project_dir_opt", help="LaTeX 项目目录")
+    parser.add_argument("-t", "--translations-file", dest="translations_opt", help="翻译 JSON 文件")
     parser.add_argument(
         "--blocks",
         help="提取阶段输出的 blocks JSON 文件（提供源文本定位信息）",
@@ -239,14 +363,21 @@ def main():
     )
     args = parser.parse_args()
 
-    root = Path(args.project_dir).resolve()
+    project_dir = args.project_dir or args.project_dir_opt
+    translations_arg = args.translations or args.translations_opt
+    if not project_dir:
+        parser.error("需要提供 project_dir 或 -d/--dir")
+    if not translations_arg:
+        parser.error("需要提供 translations 或 -t/--translations-file")
+
+    root = Path(project_dir).resolve()
     if not root.is_dir():
         print(f"[ERROR] 目录不存在: {args.project_dir}", file=sys.stderr)
         sys.exit(1)
 
-    trans_file = Path(args.translations)
+    trans_file = Path(translations_arg)
     if not trans_file.is_file():
-        print(f"[ERROR] 翻译文件不存在: {args.translations}", file=sys.stderr)
+        print(f"[ERROR] 翻译文件不存在: {translations_arg}", file=sys.stderr)
         sys.exit(1)
 
     translations = load_translations(trans_file)

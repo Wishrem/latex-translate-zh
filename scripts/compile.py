@@ -167,6 +167,77 @@ class LaTeXCompiler:
         if self.shell_escape:
             print("[WARNING] Shell escape enabled. Only use with trusted sources.")
 
+    def _log_file(self, outdir: Optional[str] = None) -> Path:
+        if outdir:
+            return (self.work_dir / outdir / self.tex_file.with_suffix(".log").name).resolve()
+        return self.tex_file.with_suffix(".log")
+
+    def _validate_log(self, outdir: Optional[str] = None) -> tuple[bool, list[str]]:
+        """Reject PDFs produced from logs that still contain real TeX errors."""
+        log_file = self._log_file(outdir)
+        if not log_file.exists():
+            return False, [f"日志文件不存在: {log_file}"]
+
+        text = log_file.read_text(encoding="utf-8", errors="ignore")
+        problems: list[str] = []
+
+        error_lines = []
+        for line in text.splitlines():
+            if line.startswith("! "):
+                # Font warnings are logged as warnings, not bang-errors. Any
+                # remaining bang line means TeX recovered after a real error.
+                error_lines.append(line.strip())
+                if len(error_lines) >= 12:
+                    break
+        if error_lines:
+            problems.append("LaTeX 错误仍存在: " + " | ".join(error_lines))
+
+        failure_patterns = [
+            r"Emergency stop",
+            r"Fatal error occurred",
+            r"Undefined control sequence",
+            r"Misplaced alignment tab character",
+            r"Missing \$ inserted",
+            r"Extra \}, or forgotten",
+            r"File `[^']+' not found",
+            r"Unable to load picture or PDF file",
+            r"Package graphics Error",
+        ]
+        for pattern in failure_patterns:
+            if re.search(pattern, text):
+                problems.append(f"日志匹配失败模式: {pattern}")
+
+        unresolved_patterns = [
+            r"undefined references",
+            r"Citation .* undefined",
+            r"Reference .* undefined",
+            r"There were undefined references",
+            r"Label\(s\) may have changed",
+        ]
+        for pattern in unresolved_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                problems.append(f"交叉引用/引用未稳定: {pattern}")
+
+        return not problems, problems
+
+    def _report_validation(self, outdir: Optional[str] = None) -> int:
+        pdf_file = self.tex_file.with_suffix(".pdf")
+        if outdir:
+            pdf_file = (self.work_dir / outdir / pdf_file.name).resolve()
+        if not pdf_file.exists():
+            print(f"\n[ERROR] PDF not found: {pdf_file}")
+            return 1
+
+        ok, problems = self._validate_log(outdir)
+        if not ok:
+            print(f"\n[ERROR] PDF was produced but validation failed: {pdf_file}")
+            for problem in problems[:10]:
+                print(f"  - {problem}")
+            return 1
+
+        print(f"\n[SUCCESS] PDF generated and validated: {pdf_file}")
+        return 0
+
     def compile(
         self, watch: bool = False, biber: bool = False, outdir: Optional[str] = None
     ) -> int:
@@ -218,7 +289,7 @@ class LaTeXCompiler:
 
         # Biber support
         if biber:
-            cmd.append("-bibtex")
+            cmd.append("-use-biber")
 
         # Watch mode
         if watch:
@@ -236,8 +307,7 @@ class LaTeXCompiler:
                 capture_output=False,
             )
             if result.returncode == 0:
-                pdf_file = self.tex_file.with_suffix(".pdf")
-                print(f"\n[SUCCESS] PDF generated: {pdf_file}")
+                return self._report_validation(outdir)
             else:
                 print(f"\n[ERROR] Compilation failed with exit code {result.returncode}")
             return result.returncode
@@ -328,13 +398,7 @@ class LaTeXCompiler:
                 print(f"[ERROR] {e}")
                 return 1
 
-        pdf_file = self.tex_file.with_suffix(".pdf")
-        if pdf_file.exists():
-            print(f"\n[SUCCESS] PDF generated: {pdf_file}")
-            return 0
-        else:
-            print(f"\n[ERROR] PDF not found: {pdf_file}")
-            return 1
+        return self._report_validation(outdir)
 
     @staticmethod
     def _detect_os_info() -> dict:
@@ -536,6 +600,8 @@ Examples:
         """,
     )
     parser.add_argument("tex_file", nargs="?", help="主 .tex 文件路径 (--check-tools 时可选)")
+    parser.add_argument("-d", "--dir", dest="work_dir_arg", help="包含主 .tex 的目录（兼容 AGENTS.md 常用命令）")
+    parser.add_argument("--main", default="main.tex", help="-d/--dir 模式下的主 .tex 文件名，默认 main.tex")
     parser.add_argument(
         "--compiler",
         "-c",
@@ -585,9 +651,15 @@ Examples:
         sys.exit(0)
 
     # Validate input file
-    tex_path = Path(args.tex_file)
+    tex_arg = args.tex_file
+    if args.work_dir_arg and not tex_arg:
+        tex_arg = str(Path(args.work_dir_arg) / args.main)
+    if not tex_arg:
+        parser.error("需要提供 tex_file，或使用 -d/--dir 指定目录")
+
+    tex_path = Path(tex_arg)
     if not tex_path.exists():
-        print(f"[ERROR] 文件不存在: {args.tex_file}")
+        print(f"[ERROR] 文件不存在: {tex_arg}")
         sys.exit(1)
 
     if tex_path.suffix != ".tex":
@@ -602,7 +674,7 @@ Examples:
 
     # Create compiler instance
     compiler = LaTeXCompiler(
-        args.tex_file,
+        tex_arg,
         args.compiler,
         args.recipe,
         shell_escape=args.shell_escape,
